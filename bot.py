@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import discord
+from aiohttp import web
 from discord import app_commands
 from dotenv import load_dotenv
 
@@ -497,6 +498,23 @@ async def on_app_command_error(
 # Bot
 # --------------------------------------------------------------------------
 
+async def start_health_server(port: int) -> web.AppRunner:
+    """Tiny HTTP server so web hosts (e.g. Render) see an open port and an
+    uptime monitor (e.g. UptimeRobot) has something to ping."""
+
+    async def health(_request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    log.info("Health server listening on port %s", port)
+    return runner
+
+
 class VoiceBot(discord.Client):
     def __init__(self, guild_id: int) -> None:
         intents = discord.Intents.none()
@@ -508,12 +526,23 @@ class VoiceBot(discord.Client):
         self.guild_object = discord.Object(id=guild_id)
         self.tree = app_commands.CommandTree(self)
         self.tree.on_error = on_app_command_error
+        self._health_runner: web.AppRunner | None = None
 
     async def setup_hook(self) -> None:
+        # Only when PORT is set (Render sets it), so local runs open no port.
+        port = os.getenv("PORT")
+        if port:
+            self._health_runner = await start_health_server(int(port))
+
         self.add_view(PanelView())  # make old panels work after a restart
         self.tree.add_command(setup_command, guild=self.guild_object)
         await self.tree.sync(guild=self.guild_object)
         log.info("Slash command registered.")
+
+    async def close(self) -> None:
+        if self._health_runner is not None:
+            await self._health_runner.cleanup()
+        await super().close()
 
     async def on_ready(self) -> None:
         log.info("Connected as %s", self.user)
