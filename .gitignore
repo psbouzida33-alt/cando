@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Bot runtime data
+rooms.json
+rooms.json.tmp

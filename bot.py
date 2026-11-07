@@ -1,0 +1,568 @@
+"""Private Voice Bot.
+
+Python (discord.py) port of the original discord.js bot.
+
+Members join the "➕ Join To Create" voice channel and the bot creates a
+private room for them, with a control panel (buttons) to manage it.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import discord
+from discord import app_commands
+from dotenv import load_dotenv
+
+ROOMS_FILE = Path("rooms.json")
+TRIGGER_NAME = "➕ Join To Create"
+EMBED_COLOR = 0x8B5CF6
+
+log = logging.getLogger("private-voice")
+
+
+# --------------------------------------------------------------------------
+# Room storage (rooms.json — same format as the JS version)
+# --------------------------------------------------------------------------
+
+@dataclass
+class Room:
+    owner_id: int
+    trusted: list[int] = field(default_factory=list)
+    visible: bool = True
+    locked: bool = False
+
+    def to_json(self) -> dict:
+        return {
+            "ownerId": str(self.owner_id),
+            "trusted": [str(user_id) for user_id in self.trusted],
+            "visible": self.visible,
+            "locked": self.locked,
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> Room:
+        return cls(
+            owner_id=int(data["ownerId"]),
+            trusted=[int(user_id) for user_id in data.get("trusted", [])],
+            visible=bool(data.get("visible", True)),
+            locked=bool(data.get("locked", False)),
+        )
+
+
+rooms: dict[int, Room] = {}
+
+
+def load_rooms() -> None:
+    if not ROOMS_FILE.exists():
+        return
+    try:
+        saved = json.loads(ROOMS_FILE.read_text(encoding="utf-8"))
+        for channel_id, data in saved.items():
+            rooms[int(channel_id)] = Room.from_json(data)
+    except (OSError, ValueError, KeyError, TypeError):
+        log.exception("Could not load rooms")
+
+
+def save_rooms() -> None:
+    payload = {str(channel_id): room.to_json() for channel_id, room in rooms.items()}
+    tmp = ROOMS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    os.replace(tmp, ROOMS_FILE)  # atomic: never leaves a half-written file
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+
+async def resolve_member(guild: discord.Guild, user_id: int) -> discord.Member | None:
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except discord.NotFound:
+            return None
+    return member
+
+
+async def report_error(interaction: discord.Interaction, error: Exception) -> None:
+    log.error("Bot error", exc_info=error)
+    message = "Something went wrong. Check bot permissions."
+    with contextlib.suppress(discord.HTTPException):
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+
+async def update_permissions(channel: discord.VoiceChannel, room: Room) -> None:
+    """Apply visibility, lock and member permissions to the room."""
+    guild = channel.guild
+    overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {}
+
+    # Every role gets the same basic visibility/connect rules.
+    for role in guild.roles:
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=room.visible,
+            connect=False,
+        )
+
+    # Trusted members can see and join unless the room is locked.
+    for member_id in room.trusted:
+        member = await resolve_member(guild, member_id)
+        if member is not None:
+            overwrites[member] = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=not room.locked,
+            )
+
+    # The owner and the bot always have full access (set last so they win
+    # over the trusted entry, e.g. after an ownership transfer).
+    full_access = dict(
+        view_channel=True,
+        connect=True,
+        manage_channels=True,
+        move_members=True,
+    )
+
+    owner = await resolve_member(guild, room.owner_id)
+    if owner is not None:
+        overwrites[owner] = discord.PermissionOverwrite(**full_access)
+
+    overwrites[guild.me] = discord.PermissionOverwrite(**full_access)
+
+    await channel.edit(overwrites=overwrites)
+
+
+async def create_room(member: discord.Member, trigger: discord.VoiceChannel) -> None:
+    guild = member.guild
+    room = Room(owner_id=member.id)
+
+    channel = await guild.create_voice_channel(
+        name=f"{member.display_name}'s room"[:100],
+        category=trigger.category,
+    )
+
+    rooms[channel.id] = room
+    save_rooms()
+
+    try:
+        await update_permissions(channel, room)
+        await member.move_to(channel)
+    except Exception:
+        # Don't leave an orphan channel behind (e.g. the member already left).
+        rooms.pop(channel.id, None)
+        save_rooms()
+        with contextlib.suppress(discord.HTTPException):
+            await channel.delete()
+        raise
+
+    embed = discord.Embed(
+        color=EMBED_COLOR,
+        title="🎙️ Private Voice Room",
+        description=(
+            f"Owner: <@{member.id}>\n\n"
+            "Manage your room using the buttons below.\n\n"
+            "👁️ Visibility controls who can see your room.\n"
+            "🛡️ Trust lets selected members join."
+        ),
+    )
+    await channel.send(embed=embed, view=PanelView())
+
+
+# --------------------------------------------------------------------------
+# Member picker (trust / untrust / kick / transfer)
+# --------------------------------------------------------------------------
+
+PICKER_PROMPTS = {
+    "trust": "🛡️ Select a member to trust.",
+    "untrust": "❌ Select a trusted member to remove.",
+    "kick": "➡️ Select a member to kick.",
+    "transfer": "👑 Select the new owner.",
+}
+
+
+class MemberSelect(discord.ui.UserSelect):
+    def __init__(self, action: str, room_id: int) -> None:
+        super().__init__(placeholder="Select a server member", min_values=1, max_values=1)
+        self.action = action
+        self.room_id = room_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        room = rooms.get(self.room_id)
+
+        if (
+            room is None
+            or interaction.user.id != room.owner_id
+            or interaction.channel_id != self.room_id
+        ):
+            await interaction.response.send_message(
+                "Only the room owner can do this.", ephemeral=True
+            )
+            return
+
+        channel = interaction.channel
+        target = self.values[0]
+
+        if target.id == room.owner_id:
+            await interaction.response.edit_message(
+                content="You cannot select yourself.", view=None
+            )
+            return
+
+        # Permission edits can be slow (rate limits): acknowledge first.
+        await interaction.response.defer()
+
+        member = await resolve_member(interaction.guild, target.id)
+        if member is None:
+            text = "Member not found in this server."
+
+        elif self.action == "trust":
+            if member.id not in room.trusted:
+                room.trusted.append(member.id)
+            await update_permissions(channel, room)
+            save_rooms()
+            text = f"🛡️ {member} is now trusted!"
+
+        elif self.action == "untrust":
+            if member.id not in room.trusted:
+                text = "This member is not trusted."
+            else:
+                room.trusted.remove(member.id)
+                await update_permissions(channel, room)
+                save_rooms()
+                text = f"❌ {member} is no longer trusted."
+
+        elif self.action == "kick":
+            in_room = member.voice is not None and member.voice.channel is not None \
+                and member.voice.channel.id == self.room_id
+            if not in_room:
+                text = "This member is not in your room."
+            else:
+                await member.move_to(None)
+                text = f"➡️ {member} was kicked."
+
+        elif self.action == "transfer":
+            if member.id not in room.trusted:
+                text = "Trust this member before transferring ownership."
+            else:
+                room.owner_id = member.id
+                await update_permissions(channel, room)
+                save_rooms()
+                text = f"👑 {member} is now the room owner."
+
+        else:  # unknown action — should never happen
+            text = "Unknown action."
+
+        await interaction.edit_original_response(content=text, view=None)
+
+
+class MemberSelectView(discord.ui.View):
+    def __init__(self, action: str, room_id: int) -> None:
+        super().__init__(timeout=300)
+        self.add_item(MemberSelect(action, room_id))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await report_error(interaction, error)
+
+
+# --------------------------------------------------------------------------
+# Modals (rename / user limit / emoji)
+# --------------------------------------------------------------------------
+
+MODAL_TITLES = {
+    "rename": "Rename Room",
+    "limit": "Change User Limit",
+    "emoji": "Change Emoji",
+}
+
+MODAL_LABELS = {
+    "rename": "New room name",
+    "limit": "Maximum users (0-99)",
+    "emoji": "New emoji",
+}
+
+
+class RoomModal(discord.ui.Modal):
+    def __init__(self, action: str) -> None:
+        super().__init__(title=MODAL_TITLES[action])
+        self.action = action
+        self.value = discord.ui.TextInput(
+            style=discord.TextStyle.short,
+            required=True,
+        )
+        self.add_item(discord.ui.Label(text=MODAL_LABELS[action], component=self.value))
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        room = rooms.get(interaction.channel_id)
+
+        if room is None or interaction.user.id != room.owner_id:
+            await interaction.response.send_message(
+                "Only the room owner can manage this room.", ephemeral=True
+            )
+            return
+
+        channel = interaction.channel
+        value = self.value.value.strip()
+
+        if self.action == "rename":
+            if not value:
+                await interaction.response.send_message("Enter a room name.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            await channel.edit(name=value[:100])
+
+        elif self.action == "limit":
+            try:
+                limit = int(value)
+            except ValueError:
+                limit = -1
+            if not 0 <= limit <= 99:
+                await interaction.response.send_message(
+                    "Enter a number from 0 to 99.", ephemeral=True
+                )
+                return
+            await interaction.response.defer(ephemeral=True)
+            await channel.edit(user_limit=limit)
+
+        else:  # emoji
+            await interaction.response.defer(ephemeral=True)
+            await channel.edit(name=f"{value} {channel.name}"[:100])
+
+        await interaction.followup.send("Room settings updated!", ephemeral=True)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        await report_error(interaction, error)
+
+
+# --------------------------------------------------------------------------
+# Control panel
+# --------------------------------------------------------------------------
+
+class PanelView(discord.ui.View):
+    """Buttons attached to every room. Persistent (fixed custom_ids), so the
+    panels keep working after the bot restarts."""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        room = rooms.get(interaction.channel_id)
+
+        if room is None:
+            await interaction.response.send_message("Room unavailable.", ephemeral=True)
+            return False
+
+        if interaction.user.id != room.owner_id:
+            await interaction.response.send_message(
+                "Only the voice owner can use this panel.", ephemeral=True
+            )
+            return False
+
+        return True
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await report_error(interaction, error)
+
+    # ---- row 1 ----
+
+    @discord.ui.button(label="👁️ Visibility", style=discord.ButtonStyle.primary,
+                       custom_id="visibility", row=0)
+    async def visibility_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        room = rooms[interaction.channel_id]
+        await interaction.response.defer(ephemeral=True)
+
+        room.visible = not room.visible
+        await update_permissions(interaction.channel, room)
+        save_rooms()
+
+        await interaction.followup.send(
+            "👁️ Room is now visible to everyone. Only you and trusted members can join."
+            if room.visible
+            else "🔒 Room is now hidden. Only you and trusted members can see and join.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🔒 Lock / Unlock", style=discord.ButtonStyle.secondary,
+                       custom_id="lock", row=0)
+    async def lock_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        room = rooms[interaction.channel_id]
+        await interaction.response.defer(ephemeral=True)
+
+        room.locked = not room.locked
+        await update_permissions(interaction.channel, room)
+        save_rooms()
+
+        await interaction.followup.send(
+            "🔒 Room locked. Trusted members cannot join until unlocked."
+            if room.locked
+            else "🔓 Room unlocked. Trusted members can join again.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="✏️ Rename", style=discord.ButtonStyle.primary,
+                       custom_id="rename", row=0)
+    async def rename_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RoomModal("rename"))
+
+    @discord.ui.button(label="👥 User Limit", style=discord.ButtonStyle.secondary,
+                       custom_id="limit", row=0)
+    async def limit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RoomModal("limit"))
+
+    @discord.ui.button(label="😊 Emoji", style=discord.ButtonStyle.secondary,
+                       custom_id="emoji", row=0)
+    async def emoji_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(RoomModal("emoji"))
+
+    # ---- row 2 ----
+
+    @discord.ui.button(label="🛡️ Trust", style=discord.ButtonStyle.success,
+                       custom_id="trust", row=1)
+    async def trust_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick_member(interaction, "trust")
+
+    @discord.ui.button(label="❌ Untrust", style=discord.ButtonStyle.secondary,
+                       custom_id="untrust", row=1)
+    async def untrust_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick_member(interaction, "untrust")
+
+    @discord.ui.button(label="➡️ Kick", style=discord.ButtonStyle.danger,
+                       custom_id="kick", row=1)
+    async def kick_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick_member(interaction, "kick")
+
+    @discord.ui.button(label="👑 Transfer", style=discord.ButtonStyle.primary,
+                       custom_id="transfer", row=1)
+    async def transfer_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._pick_member(interaction, "transfer")
+
+    @discord.ui.button(label="🗑️ Delete", style=discord.ButtonStyle.danger,
+                       custom_id="delete", row=1)
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        channel = interaction.channel
+        rooms.pop(channel.id, None)
+        save_rooms()
+
+        await interaction.response.send_message("Room deleted!", ephemeral=True)
+        await channel.delete()
+
+    @staticmethod
+    async def _pick_member(interaction: discord.Interaction, action: str) -> None:
+        await interaction.response.send_message(
+            PICKER_PROMPTS[action],
+            view=MemberSelectView(action, interaction.channel_id),
+            ephemeral=True,
+        )
+
+
+# --------------------------------------------------------------------------
+# /setup command
+# --------------------------------------------------------------------------
+
+@app_commands.command(name="setup", description="Create Join To Create")
+@app_commands.guild_only()
+async def setup_command(interaction: discord.Interaction) -> None:
+    if not interaction.permissions.administrator:
+        await interaction.response.send_message(
+            "Administrator permission required.", ephemeral=True
+        )
+        return
+
+    existing = discord.utils.get(interaction.guild.voice_channels, name=TRIGGER_NAME)
+    if existing is not None:
+        await interaction.response.send_message(
+            "Join To Create already exists!", ephemeral=True
+        )
+        return
+
+    trigger = await interaction.guild.create_voice_channel(name=TRIGGER_NAME)
+    await interaction.response.send_message(
+        f"Created {trigger.mention}! Join it to create your room.", ephemeral=True
+    )
+
+
+async def on_app_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    await report_error(interaction, error)
+
+
+# --------------------------------------------------------------------------
+# Bot
+# --------------------------------------------------------------------------
+
+class VoiceBot(discord.Client):
+    def __init__(self, guild_id: int) -> None:
+        intents = discord.Intents.none()
+        intents.guilds = True
+        intents.voice_states = True
+        intents.members = True  # privileged: enable it in the Developer Portal
+        super().__init__(intents=intents)
+
+        self.guild_object = discord.Object(id=guild_id)
+        self.tree = app_commands.CommandTree(self)
+        self.tree.on_error = on_app_command_error
+
+    async def setup_hook(self) -> None:
+        self.add_view(PanelView())  # make old panels work after a restart
+        self.tree.add_command(setup_command, guild=self.guild_object)
+        await self.tree.sync(guild=self.guild_object)
+        log.info("Slash command registered.")
+
+    async def on_ready(self) -> None:
+        log.info("Connected as %s", self.user)
+        log.info("Private Voice Bot is online!")
+
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        joined, left = after.channel, before.channel
+
+        if (
+            isinstance(joined, discord.VoiceChannel)
+            and joined.name == TRIGGER_NAME
+            and joined != left
+        ):
+            try:
+                await create_room(member, joined)
+            except Exception:
+                log.exception("Room creation error")
+
+        if left is not None and left.id in rooms and not left.members:
+            rooms.pop(left.id, None)
+            save_rooms()
+            try:
+                await left.delete()
+            except discord.HTTPException:
+                log.exception("Could not delete empty room")
+
+
+def main() -> None:
+    load_dotenv()
+
+    token = os.getenv("DISCORD_TOKEN")
+    guild_id = os.getenv("GUILD_ID")
+
+    if not token or not guild_id:
+        raise SystemExit("Check your .env configuration (DISCORD_TOKEN and GUILD_ID are required).")
+
+    try:
+        guild_id_int = int(guild_id)
+    except ValueError:
+        raise SystemExit("GUILD_ID must be a numeric server ID.") from None
+
+    load_rooms()
+    VoiceBot(guild_id_int).run(token, root_logger=True)
+
+
+if __name__ == "__main__":
+    main()
