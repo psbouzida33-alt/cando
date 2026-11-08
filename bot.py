@@ -101,29 +101,52 @@ async def report_error(interaction: discord.Interaction, error: Exception) -> No
             await interaction.response.send_message(message, ephemeral=True)
 
 
+def is_role_target(target: discord.abc.Snowflake) -> bool:
+    """True for a role overwrite (a role missing from the cache shows up as a
+    type-aware discord.Object, so check for that too)."""
+    return isinstance(target, discord.Role) or (
+        isinstance(target, discord.Object) and target.type is discord.Role
+    )
+
+
 async def update_permissions(channel: discord.VoiceChannel, room: Room) -> None:
-    """Apply visibility, lock and member permissions to the room."""
+    """Apply the room's state on top of the channel's existing permissions.
+
+    Rooms are open by default. The bot only manages:
+      * @everyone: View Channel (Visibility button) and Connect (Lock button),
+        set explicitly to allow/deny. Nothing else about @everyone changes.
+      * the owner and the bot: full access.
+      * trusted members: can always see and join, even when the room is
+        hidden or locked.
+    Every other overwrite (Speak, Video, Read Message History... inherited
+    from the category, other roles) is left exactly as it is.
+    """
     guild = channel.guild
-    overwrites: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {}
 
-    # Every role gets the same basic visibility/connect rules.
-    for role in guild.roles:
-        overwrites[role] = discord.PermissionOverwrite(
-            view_channel=room.visible,
-            connect=False,
-        )
+    # Start from the current role overwrites, keyed by id so a target can't
+    # appear twice. Member overwrites are deliberately NOT carried over: they
+    # are rebuilt below, so an untrusted member or the previous owner loses
+    # their special access.
+    current = {
+        target.id: (target, overwrite)
+        for target, overwrite in channel.overwrites.items()
+        if is_role_target(target)
+    }
 
-    # Trusted members can see and join unless the room is locked.
+    def patch(target: discord.Role | discord.Member, **changes: bool) -> None:
+        overwrite = channel.overwrites_for(target)  # fresh copy of what's there now
+        overwrite.update(**changes)
+        current[target.id] = (target, overwrite)
+
+    patch(guild.default_role, view_channel=room.visible, connect=not room.locked)
+
     for member_id in room.trusted:
         member = await resolve_member(guild, member_id)
         if member is not None:
-            overwrites[member] = discord.PermissionOverwrite(
-                view_channel=True,
-                connect=not room.locked,
-            )
+            patch(member, view_channel=True, connect=True)
 
-    # The owner and the bot always have full access (set last so they win
-    # over the trusted entry, e.g. after an ownership transfer).
+    # The owner and the bot always have full access (patched after the trusted
+    # members so they win, e.g. after an ownership transfer).
     full_access = dict(
         view_channel=True,
         connect=True,
@@ -133,11 +156,11 @@ async def update_permissions(channel: discord.VoiceChannel, room: Room) -> None:
 
     owner = await resolve_member(guild, room.owner_id)
     if owner is not None:
-        overwrites[owner] = discord.PermissionOverwrite(**full_access)
+        patch(owner, **full_access)
 
-    overwrites[guild.me] = discord.PermissionOverwrite(**full_access)
+    patch(guild.me, **full_access)
 
-    await channel.edit(overwrites=overwrites)
+    await channel.edit(overwrites=dict(current.values()))
 
 
 async def create_room(member: discord.Member, trigger: discord.VoiceChannel) -> None:
@@ -170,7 +193,8 @@ async def create_room(member: discord.Member, trigger: discord.VoiceChannel) -> 
             f"Owner: <@{member.id}>\n\n"
             "Manage your room using the buttons below.\n\n"
             "👁️ Visibility controls who can see your room.\n"
-            "🛡️ Trust lets selected members join."
+            "🔒 Lock stops everyone else from joining.\n"
+            "🛡️ Trust lets selected members see and join even when it is hidden or locked."
         ),
     )
     await channel.send(embed=embed, view=PanelView())
@@ -383,9 +407,9 @@ class PanelView(discord.ui.View):
         save_rooms()
 
         await interaction.followup.send(
-            "👁️ Room is now visible to everyone. Only you and trusted members can join."
+            "👁️ Room is now visible to everyone."
             if room.visible
-            else "🔒 Room is now hidden. Only you and trusted members can see and join.",
+            else "🔒 Room is now hidden. Only you and trusted members can see it.",
             ephemeral=True,
         )
 
@@ -400,9 +424,9 @@ class PanelView(discord.ui.View):
         save_rooms()
 
         await interaction.followup.send(
-            "🔒 Room locked. Trusted members cannot join until unlocked."
+            "🔒 Room locked. Only you and trusted members can join."
             if room.locked
-            else "🔓 Room unlocked. Trusted members can join again.",
+            else "🔓 Room unlocked. Everyone can join.",
             ephemeral=True,
         )
 
