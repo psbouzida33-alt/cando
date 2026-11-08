@@ -123,6 +123,7 @@ def remove_channel_data(channel_id):
 intents = discord.Intents.default()
 intents.members = True
 intents.voice_states = True
+intents.message_content = True  # needed for the !leaderboard prefix command
 
 bot = commands.Bot(
     command_prefix="!",
@@ -979,6 +980,76 @@ async def help_command(interaction: discord.Interaction):
         embed=embed,
         ephemeral=True
     )
+
+
+# ==========================================
+# LEADERBOARD COMMAND (prefix: !leaderboard)
+# ==========================================
+
+@bot.command(name="leaderboard", aliases=["voicestats", "rooms"])
+@commands.guild_only()
+async def leaderboard(ctx):
+    guild = ctx.guild
+
+    # 1. Récupérer uniquement les salons vocaux qui ont au moins 1 personne connectée
+    active_channels = [vc for vc in guild.voice_channels if len(vc.members) > 0]
+
+    # Trier du plus actif (plus grand nombre de membres) au moins actif
+    active_channels.sort(key=lambda vc: len(vc.members), reverse=True)
+
+    # Nombre total de personnes en vocal sur tout le serveur
+    total_in_voice = sum(len(vc.members) for vc in guild.voice_channels)
+
+    # Création de l'embed principal (style "Command Deck")
+    embed = discord.Embed(
+        title="🎙️ ELITE VOICE • COMMAND DECK",
+        description=f"Personnes connectées en vocal en ce moment : **{total_in_voice}**",
+        color=discord.Color.from_rgb(111, 75, 186)  # Thème violet/sombre
+    )
+
+    if not active_channels:
+        embed.add_field(
+            name="Aucun salon actif",
+            value="Il n'y a personne dans les salons vocaux actuellement.",
+            inline=False
+        )
+        await ctx.send(embed=embed)
+        return
+
+    # 2. Afficher le top des salons actifs (par exemple, les 5 premiers)
+    for i, vc in enumerate(active_channels[:5], start=1):
+        member_count = len(vc.members)
+
+        # Barre de progression textuelle (ex: 3 membres = 3 blocs pleins)
+        bar_length = min(member_count, 10)
+        progress_bar = "█" * bar_length + "░" * (10 - bar_length)
+
+        # Liste des pseudos des membres connectés dans ce salon spécifique
+        member_names = ", ".join([m.display_name for m in vc.members[:5]])
+        if member_count > 5:
+            member_names += f" *et {member_count - 5} de plus...*"
+
+        # Vérifier si le salon est verrouillé (basé sur les permissions du rôle @everyone)
+        is_locked = vc.permissions_for(guild.default_role).connect == False
+        lock_emoji = "🔒" if is_locked else "🔓"
+
+        field_value = (
+            f"`{progress_bar}` {member_count} / ∞\n"
+            f"👤 **Membres :** {member_names}"
+        )
+
+        embed.add_field(
+            name=f"#{i:02d} | {vc.name} {lock_emoji}",
+            value=field_value,
+            inline=False
+        )
+
+    embed.set_footer(
+        text=f"Demandé par {ctx.author.display_name} • Mise à jour en direct",
+        icon_url=ctx.author.avatar.url if ctx.author.avatar else None
+    )
+
+    await ctx.send(embed=embed)
 
 
 # ==========================================
