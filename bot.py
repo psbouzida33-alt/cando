@@ -4,7 +4,8 @@ Python (discord.py) port of the original discord.js bot.
 
 Members join the "➕ Join To Create" voice channel and the bot creates a
 private room for them, with a control panel (buttons) to manage it. Each
-room gets a random emoji that is shown on the nickname of everyone inside.
+room gets a random emoji that is shown in the room's name and on the
+nickname of everyone inside.
 """
 
 from __future__ import annotations
@@ -60,7 +61,7 @@ class Room:
     owner_id: int
     trusted: list[int] = field(default_factory=list)
     locked: bool = False
-    emoji: str = ""  # shown on the nickname of everyone inside ("" = none)
+    emoji: str = ""  # shown in the room name and on nicknames ("" = none)
 
     def to_json(self) -> dict:
         return {
@@ -192,7 +193,7 @@ async def create_room(member: discord.Member, trigger: discord.VoiceChannel) -> 
     room = Room(owner_id=member.id, emoji=random.choice(EMOJIS))
 
     channel = await guild.create_voice_channel(
-        name=f"{member.display_name}'s room"[:100],
+        name=room_name(room.emoji, f"{plain_name(member)}'s room"),
         category=trigger.category,
     )
 
@@ -224,11 +225,12 @@ async def create_room(member: discord.Member, trigger: discord.VoiceChannel) -> 
 
 
 # --------------------------------------------------------------------------
-# Room emoji on nicknames
+# Room emoji (channel name and nicknames)
 #
-# While a member is inside a room their nickname shows the room's emoji on
-# the left ("🔥 Ahmed"). When they leave, the original nickname comes back.
-# The originals are kept in nicknames.json so a restart doesn't lose them.
+# Every room's name starts with its emoji ("🔥・Ahmed's room"). While a member
+# is inside a room their nickname shows it on the left too ("🔥 Ahmed"), and
+# when they leave their original nickname comes back. The originals are kept
+# in nicknames.json so a restart doesn't lose them.
 # --------------------------------------------------------------------------
 
 # user id -> nickname they had before the emoji (None = they had no nickname)
@@ -266,6 +268,20 @@ def emoji_nick(emoji: str, name: str) -> str:
     return f"{emoji} {name}"
 
 
+def room_name(emoji: str, name: str) -> str:
+    """Channel name for a room: '<emoji>・<name>' (just the name if the room
+    has no emoji), cut to Discord's 100-character limit."""
+    return (f"{emoji}・{name}" if emoji else name)[:100]
+
+
+def plain_name(member: discord.Member) -> str:
+    """The member's name without the room emoji we put on their nickname, so
+    moving from one room to a new one never gives '🔥・🔥 Ahmed's room'."""
+    if member.id in saved_nicks:
+        return saved_nicks[member.id] or member.global_name or member.name
+    return member.display_name
+
+
 def is_trigger_channel(channel: discord.abc.GuildChannel | None) -> bool:
     return isinstance(channel, discord.VoiceChannel) and channel.name == TRIGGER_NAME
 
@@ -277,8 +293,7 @@ async def show_room_emoji(member: discord.Member, emoji: str) -> None:
         saved_nicks[member.id] = member.nick
         save_nicks()
 
-    original = saved_nicks[member.id]
-    new_nick = emoji_nick(emoji, original or member.global_name or member.name)
+    new_nick = emoji_nick(emoji, plain_name(member))
 
     if member.nick == new_nick:
         return
@@ -486,7 +501,7 @@ class RoomModal(discord.ui.Modal):
                 await interaction.response.send_message("Enter a room name.", ephemeral=True)
                 return
             await interaction.response.defer(ephemeral=True)
-            await channel.edit(name=value[:100])
+            await channel.edit(name=room_name(room.emoji, value))
 
         else:  # limit
             try:
