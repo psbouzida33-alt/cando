@@ -222,3 +222,4 @@ __marimo__/
 # Bot runtime data
 rooms.json
 rooms.json.tmp
+join_to_create.db
