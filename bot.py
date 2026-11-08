@@ -28,21 +28,19 @@ log = logging.getLogger("private-voice")
 
 
 # --------------------------------------------------------------------------
-# Room storage (rooms.json — same format as the JS version)
+# Room storage (rooms.json)
 # --------------------------------------------------------------------------
 
 @dataclass
 class Room:
     owner_id: int
     trusted: list[int] = field(default_factory=list)
-    visible: bool = True
     locked: bool = False
 
     def to_json(self) -> dict:
         return {
             "ownerId": str(self.owner_id),
             "trusted": [str(user_id) for user_id in self.trusted],
-            "visible": self.visible,
             "locked": self.locked,
         }
 
@@ -51,7 +49,6 @@ class Room:
         return cls(
             owner_id=int(data["ownerId"]),
             trusted=[int(user_id) for user_id in data.get("trusted", [])],
-            visible=bool(data.get("visible", True)),
             locked=bool(data.get("locked", False)),
         )
 
@@ -113,11 +110,11 @@ async def update_permissions(channel: discord.VoiceChannel, room: Room) -> None:
     """Apply the room's state on top of the channel's existing permissions.
 
     Rooms are open by default. The bot only manages:
-      * @everyone: View Channel (Visibility button) and Connect (Lock button),
+      * @everyone: View Channel (always allowed) and Connect (Lock button),
         set explicitly to allow/deny. Nothing else about @everyone changes.
       * the owner and the bot: full access.
       * trusted members: can always see and join, even when the room is
-        hidden or locked.
+        locked.
     Every other overwrite (Speak, Video, Read Message History... inherited
     from the category, other roles) is left exactly as it is.
     """
@@ -138,7 +135,7 @@ async def update_permissions(channel: discord.VoiceChannel, room: Room) -> None:
         overwrite.update(**changes)
         current[target.id] = (target, overwrite)
 
-    patch(guild.default_role, view_channel=room.visible, connect=not room.locked)
+    patch(guild.default_role, view_channel=True, connect=not room.locked)
 
     for member_id in room.trusted:
         member = await resolve_member(guild, member_id)
@@ -192,9 +189,8 @@ async def create_room(member: discord.Member, trigger: discord.VoiceChannel) -> 
         description=(
             f"Owner: <@{member.id}>\n\n"
             "Manage your room using the buttons below.\n\n"
-            "👁️ Visibility controls who can see your room.\n"
             "🔒 Lock stops everyone else from joining.\n"
-            "🛡️ Trust lets selected members see and join even when it is hidden or locked."
+            "🛡️ Trust lets selected members join even when the room is locked."
         ),
     )
     await channel.send(embed=embed, view=PanelView())
@@ -297,19 +293,17 @@ class MemberSelectView(discord.ui.View):
 
 
 # --------------------------------------------------------------------------
-# Modals (rename / user limit / emoji)
+# Modals (rename / user limit)
 # --------------------------------------------------------------------------
 
 MODAL_TITLES = {
     "rename": "Rename Room",
     "limit": "Change User Limit",
-    "emoji": "Change Emoji",
 }
 
 MODAL_LABELS = {
     "rename": "New room name",
     "limit": "Maximum users (0-99)",
-    "emoji": "New emoji",
 }
 
 
@@ -342,7 +336,7 @@ class RoomModal(discord.ui.Modal):
             await interaction.response.defer(ephemeral=True)
             await channel.edit(name=value[:100])
 
-        elif self.action == "limit":
+        else:  # limit
             try:
                 limit = int(value)
             except ValueError:
@@ -354,10 +348,6 @@ class RoomModal(discord.ui.Modal):
                 return
             await interaction.response.defer(ephemeral=True)
             await channel.edit(user_limit=limit)
-
-        else:  # emoji
-            await interaction.response.defer(ephemeral=True)
-            await channel.edit(name=f"{value} {channel.name}"[:100])
 
         await interaction.followup.send("Room settings updated!", ephemeral=True)
 
@@ -396,23 +386,6 @@ class PanelView(discord.ui.View):
 
     # ---- row 1 ----
 
-    @discord.ui.button(label="👁️ Visibility", style=discord.ButtonStyle.primary,
-                       custom_id="visibility", row=0)
-    async def visibility_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        room = rooms[interaction.channel_id]
-        await interaction.response.defer(ephemeral=True)
-
-        room.visible = not room.visible
-        await update_permissions(interaction.channel, room)
-        save_rooms()
-
-        await interaction.followup.send(
-            "👁️ Room is now visible to everyone."
-            if room.visible
-            else "🔒 Room is now hidden. Only you and trusted members can see it.",
-            ephemeral=True,
-        )
-
     @discord.ui.button(label="🔒 Lock / Unlock", style=discord.ButtonStyle.secondary,
                        custom_id="lock", row=0)
     async def lock_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -439,11 +412,6 @@ class PanelView(discord.ui.View):
                        custom_id="limit", row=0)
     async def limit_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(RoomModal("limit"))
-
-    @discord.ui.button(label="😊 Emoji", style=discord.ButtonStyle.secondary,
-                       custom_id="emoji", row=0)
-    async def emoji_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(RoomModal("emoji"))
 
     # ---- row 2 ----
 
