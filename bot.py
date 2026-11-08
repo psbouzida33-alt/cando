@@ -3,7 +3,8 @@
 Python (discord.py) port of the original discord.js bot.
 
 Members join the "➕ Join To Create" voice channel and the bot creates a
-private room for them, with a control panel (buttons) to manage it.
+private room for them, with a control panel (buttons) to manage it. Each
+room gets a random emoji that is shown on the nickname of everyone inside.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import contextlib
 import json
 import logging
 import os
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,8 +23,30 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 ROOMS_FILE = Path("rooms.json")
+NICKS_FILE = Path("nicknames.json")
 TRIGGER_NAME = "➕ Join To Create"
 EMBED_COLOR = 0x8B5CF6
+NICK_MAX = 32  # Discord's nickname length limit
+
+# Random emoji given to every new room (same list as join_to_create.py).
+EMOJIS = [
+    "🔥", "⚡", "💥", "☄️", "🌋", "✨", "💫", "🌟",
+    "🌙", "🌑", "🌕", "🪐", "🚀", "👽", "🛸", "⭐",
+    "👑", "💎", "💍", "🏆", "🥇", "💰", "🤑", "🪙",
+    "🌸", "🌺", "🌻", "🌹", "🌷", "🍀", "🌴", "🍁",
+    "🍄", "🌿", "🌵", "🌼", "🪷", "🌳",
+    "🐉", "🐲", "🦋", "🦇", "🐺", "🦊", "🐼", "🐸",
+    "🐍", "🦈", "🐬", "🦁", "🐯", "🐻", "🦄", "🐧",
+    "🎮", "🕹️", "👾", "🎯", "🏹", "⚔️", "🛡️", "🎲",
+    "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍",
+    "🤎", "🩷", "🩵", "💖", "💗", "💓", "💝",
+    "🎧", "🎵", "🎶", "🎼", "🎤", "🎹", "🎸", "🥁",
+    "🌈", "🌪️", "❄️", "☀️", "🌧️", "⛈️", "🌊", "🌬️",
+    "🍓", "🍒", "🍉", "🍇", "🍍", "🥑", "🍕", "🍭",
+    "♠️", "♥️", "♦️", "♣️", "🔮", "🧿", "☯️", "♾️",
+    "🎭", "🎪", "🎡", "🎆", "🎇", "🪄", "🧸", "🎀",
+    "🪽", "🪼", "🦚", "🪸", "🧩", "🔱", "💠", "🔔",
+]
 
 log = logging.getLogger("private-voice")
 
@@ -36,12 +60,14 @@ class Room:
     owner_id: int
     trusted: list[int] = field(default_factory=list)
     locked: bool = False
+    emoji: str = ""  # shown on the nickname of everyone inside ("" = none)
 
     def to_json(self) -> dict:
         return {
             "ownerId": str(self.owner_id),
             "trusted": [str(user_id) for user_id in self.trusted],
             "locked": self.locked,
+            "emoji": self.emoji,
         }
 
     @classmethod
@@ -50,6 +76,7 @@ class Room:
             owner_id=int(data["ownerId"]),
             trusted=[int(user_id) for user_id in data.get("trusted", [])],
             locked=bool(data.get("locked", False)),
+            emoji=str(data.get("emoji", "")),
         )
 
 
@@ -162,7 +189,7 @@ async def update_permissions(channel: discord.VoiceChannel, room: Room) -> None:
 
 async def create_room(member: discord.Member, trigger: discord.VoiceChannel) -> None:
     guild = member.guild
-    room = Room(owner_id=member.id)
+    room = Room(owner_id=member.id, emoji=random.choice(EMOJIS))
 
     channel = await guild.create_voice_channel(
         name=f"{member.display_name}'s room"[:100],
@@ -194,6 +221,131 @@ async def create_room(member: discord.Member, trigger: discord.VoiceChannel) -> 
         ),
     )
     await channel.send(embed=embed, view=PanelView())
+
+
+# --------------------------------------------------------------------------
+# Room emoji on nicknames
+#
+# While a member is inside a room their nickname shows the room's emoji on
+# the left ("🔥 Ahmed"). When they leave, the original nickname comes back.
+# The originals are kept in nicknames.json so a restart doesn't lose them.
+# --------------------------------------------------------------------------
+
+# user id -> nickname they had before the emoji (None = they had no nickname)
+saved_nicks: dict[int, str | None] = {}
+
+
+def load_nicks() -> None:
+    if not NICKS_FILE.exists():
+        return
+    try:
+        saved = json.loads(NICKS_FILE.read_text(encoding="utf-8"))
+        for user_id, nick in saved.items():
+            saved_nicks[int(user_id)] = nick
+    except (OSError, ValueError, TypeError):
+        log.exception("Could not load saved nicknames")
+
+
+def save_nicks() -> None:
+    payload = {str(user_id): nick for user_id, nick in saved_nicks.items()}
+    tmp = NICKS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, NICKS_FILE)
+
+
+def utf16_len(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def emoji_nick(emoji: str, name: str) -> str:
+    """'<emoji> <name>', with the name cut to fit Discord's nickname limit
+    (measured in UTF-16 units, the strictest way to count)."""
+    room_for_name = max(1, NICK_MAX - utf16_len(emoji) - 1)
+    while len(name) > 1 and utf16_len(name) > room_for_name:
+        name = name[:-1]
+    return f"{emoji} {name}"
+
+
+def is_trigger_channel(channel: discord.abc.GuildChannel | None) -> bool:
+    return isinstance(channel, discord.VoiceChannel) and channel.name == TRIGGER_NAME
+
+
+async def show_room_emoji(member: discord.Member, emoji: str) -> None:
+    first_time = member.id not in saved_nicks
+    if first_time:
+        # Remember the real nickname BEFORE changing it, so nothing can lose it.
+        saved_nicks[member.id] = member.nick
+        save_nicks()
+
+    original = saved_nicks[member.id]
+    new_nick = emoji_nick(emoji, original or member.global_name or member.name)
+
+    if member.nick == new_nick:
+        return
+
+    try:
+        await member.edit(nick=new_nick, reason="Joined a private voice room")
+    except discord.HTTPException as error:
+        # Can't rename this member (server owner, higher role, missing
+        # Manage Nicknames...). Don't track them: there is nothing to restore.
+        log.warning("Cannot set nickname for %s: %s", member, error)
+        if first_time:
+            saved_nicks.pop(member.id, None)
+            save_nicks()
+
+
+async def restore_nickname(member: discord.Member) -> None:
+    if member.id not in saved_nicks:
+        return
+
+    try:
+        await member.edit(nick=saved_nicks[member.id], reason="Left the private voice room")
+    except discord.NotFound:
+        pass  # they left the server: nothing to restore
+    except discord.Forbidden:
+        log.warning("Cannot restore nickname for %s", member)
+    except discord.HTTPException:
+        log.exception("Could not restore nickname for %s", member)
+        return  # keep it saved so a later restore can try again
+
+    saved_nicks.pop(member.id, None)
+    save_nicks()
+
+
+async def sync_nickname(
+    member: discord.Member, channel: discord.abc.GuildChannel | None
+) -> None:
+    """Run when a member's voice channel changes: show the room's emoji while
+    they are in a room, put their own nickname back everywhere else."""
+    room = rooms.get(channel.id) if channel is not None else None
+
+    if room is not None and room.emoji:
+        await show_room_emoji(member, room.emoji)
+    elif not is_trigger_channel(channel):
+        # (Waiting in the trigger channel is skipped: their room is being
+        # created and they'll be moved straight into it.)
+        await restore_nickname(member)
+
+
+async def restore_stale_nicknames(guild: discord.Guild) -> None:
+    """After a (re)start: give the nickname back to anyone who is no longer in
+    a room, e.g. because they left while the bot was offline."""
+    for user_id in list(saved_nicks):
+        try:
+            member = await resolve_member(guild, user_id)
+            if member is None:  # no longer in the server
+                saved_nicks.pop(user_id, None)
+                continue
+
+            channel = member.voice.channel if member.voice else None
+            if channel is not None and (channel.id in rooms or is_trigger_channel(channel)):
+                continue  # still inside a room
+
+            await restore_nickname(member)
+        except discord.HTTPException:
+            log.exception("Could not check saved nickname of %s", user_id)
+
+    save_nicks()
 
 
 # --------------------------------------------------------------------------
@@ -439,10 +591,16 @@ class PanelView(discord.ui.View):
                        custom_id="delete", row=1)
     async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         channel = interaction.channel
+        members = list(channel.members)
         rooms.pop(channel.id, None)
         save_rooms()
 
         await interaction.response.send_message("Room deleted!", ephemeral=True)
+
+        # Give everyone inside their nickname back before the channel goes.
+        for member in members:
+            await restore_nickname(member)
+
         await channel.delete()
 
     @staticmethod
@@ -540,6 +698,13 @@ class VoiceBot(discord.Client):
         log.info("Connected as %s", self.user)
         log.info("Private Voice Bot is online!")
 
+        guild = self.get_guild(self.guild_object.id)
+        if guild is not None:
+            try:
+                await restore_stale_nicknames(guild)
+            except Exception:
+                log.exception("Nickname cleanup error")
+
     async def on_voice_state_update(
         self,
         member: discord.Member,
@@ -548,11 +713,7 @@ class VoiceBot(discord.Client):
     ) -> None:
         joined, left = after.channel, before.channel
 
-        if (
-            isinstance(joined, discord.VoiceChannel)
-            and joined.name == TRIGGER_NAME
-            and joined != left
-        ):
+        if is_trigger_channel(joined) and joined != left:
             try:
                 await create_room(member, joined)
             except Exception:
@@ -565,6 +726,15 @@ class VoiceBot(discord.Client):
                 await left.delete()
             except discord.HTTPException:
                 log.exception("Could not delete empty room")
+
+        # Room emoji on the nickname while inside a room, original one after.
+        # (Last, and guarded, so a nickname problem can never stop a room from
+        # being created or cleaned up.)
+        if joined != left and not member.bot:
+            try:
+                await sync_nickname(member, joined)
+            except Exception:
+                log.exception("Nickname error")
 
 
 def main() -> None:
@@ -582,6 +752,7 @@ def main() -> None:
         raise SystemExit("GUILD_ID must be a numeric server ID.") from None
 
     load_rooms()
+    load_nicks()
     VoiceBot(guild_id_int).run(token, root_logger=True)
 
 
